@@ -1,6 +1,5 @@
-import matplotlib.pyplot as plt
 import mlflow
-from mlflow.tracking.fluent import log_artifact, log_param, log_metric
+from mlflow.tracking.fluent import log_param, log_metric
 import hydra
 from transformers import BertForSequenceClassification, AdamW
 from torch.utils.data import SequentialSampler, RandomSampler, DataLoader
@@ -19,9 +18,6 @@ def train(model, dataloader, optimizer, loss_fn, device):
     model.train()
     train_loss = []
     for i, batch in enumerate(dataloader):
-        if i % 20 == 0 and i > 0:
-            print(f"batch [20s] : {i}")
-            print("loss:", np.array(train_loss).mean())
         input_ids_low, input_ids_high = batch[0].to(device), batch[1].to(device)
         output_low, output_high = model(input_ids_low), model(input_ids_high)
         loss = loss_fn(output_low, output_high)
@@ -110,14 +106,6 @@ def learn(cfg):
                     f"LIM30_simirality_e{e}_lr{cfg.learning_rate}_model"
                 )
             )
-        plt.plot(range(1, 1 + cfg.epoch), train_loss, label="train")
-        plt.plot(range(1, 1 + cfg.epoch), test_loss, label="test")
-        plt.legend()
-        plt.savefig(
-            f"c_{cfg.chain}_e_{cfg.epoch}_lr_{cfg.learning_rate}_loss.png")
-        log_artifact(
-            f"c_{cfg.chain}_e_{cfg.epoch}_lr_{cfg.learning_rate}_loss.png")
-        plt.clf()
 
 
 if __name__ == '__main__':
