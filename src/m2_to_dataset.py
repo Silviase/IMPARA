@@ -1,7 +1,3 @@
-# 文対について, ある一つの変更を適用しなかった場合の類似度を計測する．
-# n個の編集集合から部分集合をとる．このランクは 含まれる編集の類似度差(1-similarity)の総和である．
-# 任意に選んだ二つの部分集合はa.によって順序づけられる．このランクによってデータセットが作成できる．
-
 import argparse
 import os
 import pickle
@@ -16,9 +12,10 @@ LIMIT = 30
 MAX_LENGTH = 128
 ANNOTATOR = 0
 SAMPLE = 4096
+pre_trained = 'bert-base-cased'
 
-tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
-model = BertModel.from_pretrained('bert-base-cased')
+tokenizer = BertTokenizer.from_pretrained(pre_trained)
+model = BertModel.from_pretrained(pre_trained)
 
 
 def parse_m2_to_db(file):
