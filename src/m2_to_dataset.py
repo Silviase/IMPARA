@@ -1,240 +1,254 @@
-import argparse
-import os
-import pickle
-import random
-from torch.utils.data.dataset import TensorDataset
-from transformers import BertTokenizer, BertModel
-import torch
-import re
+import copy
 import numpy as np
+import argparse
+import re
+import random
+import pickle
+import torch
+from torch.utils.data import TensorDataset
+from tqdm import tqdm
+import os
+from typing import List
 
-LIMIT = 30
-MAX_LENGTH = 128
-ANNOTATOR = 0
-SAMPLE = 4096
-pre_trained = 'bert-base-cased'
+# in this repository
+from utils.bert_selector import BertSelector
 
-tokenizer = BertTokenizer.from_pretrained(pre_trained)
-model = BertModel.from_pretrained(pre_trained)
+class M2Parser:
+    def __init__(self, src) -> None:
+        self.source_file = src
+        self.db = self.parse()
 
+    # load M2 file and return list of [src, [edits]]
+    def parse(self) -> list:
+        db = []  # source, edits_per_annotator
+        edits = []
+        source = None
+        with open(self.source_file, "r") as fl:
+            for line in fl:
+                line = line.strip()
+                if line == "":
+                    if source is not None:
+                        for edits_by_id in self.split_edits_by_annot(edits):
+                            db.append((source, edits_by_id))
+                        edits = []
+                        source = None
+                elif line.startswith("S"):
+                    source = line[2:]
+                elif line.startswith("A"):
+                    properties = re.split("\|\|\|", line[2:])
+                    start, end = properties[0].split()
+                    properties[0] = end
+                    properties.insert(0, start)
+                    edits.append(properties)
+                else:
+                    raise "unrecognized line " + line
+        return db
 
-def parse_m2_to_db(file):
-    db = []
-    changes = []
-    source = None
-    with open(file, "r") as fl:
-        for line in fl:
-            line = line.strip()
-            if line == "":
-                assert source is not None
-                db.append((source, split_changes_by_annot(changes)))
-                changes = []
-                source = None
-            elif line.startswith("S"):
-                source = line[2:]
-            elif line.startswith("A"):
-                properties = re.split("\|\|\|", line[2:])
-                start, end = properties[0].split()
-                properties[0] = end
-                properties.insert(0, start)
-                changes.append(properties)
-            else:
-                raise "unrecognized line " + line
-    return db
-
-
-def split_changes_by_annot(changes):
-    res = {}
-    for change in changes:
-        annot = change[-1]
-        if annot not in res:
-            res[annot] = []
-        res[annot].append(change)
-    return list(res.values())
-
-
-def apply_changes(sentence, changes):
-    changes = sorted(changes, key=lambda x: (int(x[0]), int(x[1])))
-    res = []
-    last_end = 0
-    s = sentence.split()
-    for change in changes:
-        start = int(change[0])
-        assert last_end == 0 or last_end <= start, "changes collide in places:" + \
-            str(last_end) + ", " + str(start) + \
-            "\nSentence: " + sentence + "\nChanges " + str(changes)
-        if start == -1:
-            print("noop action, no change applied")
-            assert change[2] == "noop"
-            return sentence
-        res += s[last_end:start] + [change[3]]
-        last_end = int(change[1])
-    res += s[last_end:]
-    return " ".join(res)
+    def split_edits_by_annot(self, edits):
+        res = {}
+        for edit in edits:
+            annot = edit[-1]
+            if annot not in res:
+                res[annot] = []
+            res[annot].append(edit)
+        return list(res.values())
 
 
-def cossim(v1, v2):
-    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+class M2Dataset:
+    def __init__(self, args):
+
+        if args.use_cache:
+            print("Loading cached information...")
+            with open(args.cache, "rb") as fl:
+                self = pickle.load(fl)
+            print("Loading cached information... Done")
+
+            # config difference
+            self.output_file = args.out
+            self.dataset_size = args.dataset_size
+        else:
+            # Configuration
+            self.source_file = args.src
+            self.output_file = args.out
+            self.lang = args.lang
+            self.max_length = args.max_length
+            self.dataset_size = args.dataset_size
+            self.parallel = args.parallel
+
+            # Make directory for output file if not exists
+            if not os.path.exists(os.path.dirname(self.output_file)):
+                os.makedirs(os.path.dirname(self.output_file))
+
+            # Load BERT items
+            bert_selector = BertSelector(self.lang)
+            self.tokenizer = bert_selector.load_tokenizer()
+            self.model = bert_selector.load_pretrained_model()
+
+            # Parse M2 file and calculate impacts of each edit
+            print("Parsing M2 file...")
+            self.parser = M2Parser(self.source_file)
+            print("Parsing M2 file... Done")
+            print("Length: ", len(self.parser.db))
+
+            self.src = [s[0] for s in self.parser.db]
+            self.edits = [s[1] for s in self.parser.db]
+            print("Get target sentences...")
+            self.trg = [self.apply_edits(s, es)
+                        for s, es in zip(self.src, self.edits)]
+            print("Get target sentences... Done")
+
+            if not self.parallel:
+                # Calculate impacts of each edit
+                self.impacts = [self.calculate_impacts(s, es, trg) 
+                                for s, es, trg in tqdm(zip(self.src, self.edits, self.trg))]
+
+            # Save in cache_dir
+            with open(self.output_file + "_info.pkl", "wb") as fl:
+                pickle.dump(self, fl)
+
+        # Create dataset
+        self.dataset = self.create_dataset()
+        self.save()
+
+    def save(self):
+        with open(self.output_file + ".pkl", "wb") as fl:
+            pickle.dump(self.dataset, fl)
+
+    def calculate_impact_for_edit(self, s1, s2):
+        s1_tokens = self.tokenizer(s1, return_tensors="pt")
+        s2_tokens = self.tokenizer(s2, return_tensors="pt")
+        s1_emb = np.mean(self.model(**s1_tokens)[0][0].detach().numpy(), axis=0)
+        s2_emb = np.mean(self.model(**s2_tokens)[0][0].detach().numpy(), axis=0)
+        return 1 - min(1, np.dot(s1_emb, s2_emb) / (np.linalg.norm(s1_emb) * np.linalg.norm(s2_emb)))
+
+    def get_sentence_pairs(self):
+        lo, hi = [], []
+        for src, edits, trg, impacts in tqdm(zip(self.src, self.edits, self.trg, self.impacts), desc="Create sentence pairs"):
+            # continue if no edits
+            if len(edits) == 0 or src == trg:
+                continue
+            
+            for loop in range(min(10, len(edits) * (len(edits)-1) // 2)):
+                e1, e2, i1, i2 = self.select_two_edits(edits, impacts)
+                if sum(i1) < sum(i2):
+                    s_lo, s_hi = M2Dataset.apply_edits(src, e1), M2Dataset.apply_edits(src, e2)
+                else:
+                    s_lo, s_hi = M2Dataset.apply_edits(src, e2), M2Dataset.apply_edits(src, e1)
+
+                if s_lo == s_hi:
+                    continue
+                lo.append(s_lo)
+                hi.append(s_hi)
+        return lo, hi
+
+    def create_dataset(self):
+        print("Creating dataset...")
+        if self.parallel:
+            lo, hi = [], []
+            # filter out sentences with no edits
+            for s, t in zip(self.src, self.trg):
+                if s == t:
+                    continue
+                lo.append(s)
+                hi.append(t)
+        else:
+            lo, hi = self.get_sentence_pairs()
+
+        # Modify dataset_size
+        if len(lo) >= self.dataset_size:
+            before = len(lo)
+            selected_ids = random.sample(range(len(lo)), self.dataset_size)
+            lo = [lo[i] for i in selected_ids]
+            hi = [hi[i] for i in selected_ids]
+            assert len(lo) == len(hi) == self.dataset_size
+            print("Modified dataset size from {} to {}".format(before, self.dataset_size))
+        else:
+            print(f"Dataset size({len(lo)}) is smaller than the size to sample ({self.dataset_size})!")
+
+        with open(self.output_file + ".tsv", "w") as fl:
+            for l, h in zip(lo, hi):
+                fl.write(f"{l}\t{h}\n")
+
+        ids_lo = [self.sentence_to_ids(s) for s in tqdm(lo, desc="toknize;lo")]
+        ids_hi = [self.sentence_to_ids(s) for s in tqdm(hi, desc="toknize;hi")]
+        ids_lo = torch.cat(ids_lo, dim=0)
+        ids_hi = torch.cat(ids_hi, dim=0)
+        print("Creating dataset... Done")
+        print("Dataset size:", ids_lo.shape[0])
+        return TensorDataset(ids_lo, ids_hi)
+
+    @staticmethod
+    def apply_edits(sentence, edits):
+        edits = sorted(edits, key=lambda x: (int(x[0]), int(x[1])))
+        res = []
+        last_end = 0
+        s = sentence.split()
+        for edit in edits:
+            start = int(edit[0])
+            assert last_end == 0 or last_end <= start, "edits collide in places:" + \
+                str(last_end) + ", " + str(start) + \
+                "\nSentence: " + sentence + "\nedits " + str(edits)
+            if start == -1:
+                assert edit[2] == "noop"
+                return sentence
+            res += s[last_end:start] + [edit[3]]
+            last_end = int(edit[1])
+        res += s[last_end:]
+        return " ".join(res)
+
+    @staticmethod
+    def select_two_edits(edits, impacts):
+        n = len(edits)
+        e1_idxs = random.sample(range(n), k=random.randint(0, n))
+        e2_idxs = copy.deepcopy(e1_idxs)
+        for i in range(n):
+            if random.random() < 1 / n:
+                if i in e1_idxs:
+                    e2_idxs.remove(i)
+                else:
+                    e2_idxs.append(i)
+        e1 = [edits[i] for i in e1_idxs]
+        e2 = [edits[i] for i in e2_idxs]
+        i1 = [impacts[i] for i in e1_idxs]
+        i2 = [impacts[i] for i in e2_idxs]
+        return e1, e2, i1, i2
+
+    def calculate_impacts(self, src, edits, trg) -> List[float]:
+        impacts = []
+        for idx in range(len(edits)):
+            edits_without_e = edits[:idx] + edits[idx+1:]
+            trg_without_e = M2Dataset.apply_edits(src, edits_without_e)
+            impacts.append(self.calculate_impact_for_edit(trg, trg_without_e))
+        return impacts
+
+    def sentence_to_ids(self, sentence):
+        encoded = self.tokenizer.encode(
+            sentence,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors="pt",
+        )
+        return encoded
 
 
-def sentence_to_ids(sentence):
-    encoded = tokenizer.encode_plus(
-        sentence,
-        max_length=MAX_LENGTH,
-        padding='max_length',
-        truncation=True,
-        return_tensors="pt",
-    )
-    return encoded["input_ids"]
-
-
-def calc_similarity(sent1, sent2):
-    ids1 = tokenizer(sent1, return_tensors="pt")
-    ids2 = tokenizer(sent2, return_tensors="pt")
-    embs_s = np.mean(model(**ids1)[0][0].detach().numpy(), axis=0)
-    embs_t = np.mean(model(**ids2)[0][0].detach().numpy(), axis=0)
-    return min(1, cossim(embs_s, embs_t))
-
-
-def get_importance(source, target, edit):
-    length = len(edit[ANNOTATOR])
-    importances = []
-    for no_use in range(length):
-        use = [True] * length
-        use[no_use] = False
-        target_use = apply_all_changes(source, edit, use)
-        similarity = calc_similarity(target, target_use)
-        importance = 1 - similarity
-        importances.append(importance)
-    return importances
-
-
-def calc_rank(importances, edit):
-    rank = 0
-    for i, e in enumerate(edit):
-        if e:
-            rank += importances[i]
-    return rank
-
-
-def apply_all_changes(source, changes, use):
-    edit = []
-    for i, e in use:
-        if e:
-            edit.append(changes[ANNOTATOR][i])
-    source = apply_changes(source, edit)
-    return source
-
-
-def get_use(number):
-    use = [False for _ in range(number)]
-    k = random.randint(0, number)
-    use_idxs = random.sample(range(number), k=k)
-    for i in use_idxs:
-        assert i < number
-        use[i] = True
-    return use
-
-
-def change_use(use):
-    length = len(use)
-    res = [not x if random.random() < length else x for x in use]
-    return res
-
-
-def get_sent_pairs(source, edits, limit):
-    length = len(edits[ANNOTATOR])
-    limit = min(limit, length * (length + 1) / 2)
-    # get target sentence
-    target = apply_all_changes(source, edits, [True] * length)
-
-    # calculate importance of each edit
-    importances = get_importance(source, target, edits)
-    # print("importances", importances)
-
-    # select sentence pair
-    sent_pairs = [(source, target)]
-    if length > 1:
-        for i in range(int(limit)):
-            # select edit to use
-            use1 = get_use(length)
-            use2 = change_use(use1)
-            # get sentence
-            sentence1 = apply_all_changes(source, edits, use1)
-            sentence2 = apply_all_changes(source, edits, use2)
-            # calculate rank
-            rank1 = calc_rank(importances, use1)
-            rank2 = calc_rank(importances, use2)
-            # make sentence pair
-            if rank1 < rank2:
-                sent_pairs.append((sentence1, sentence2))
-            elif rank1 > rank2:
-                sent_pairs.append((sentence2, sentence1))
-    print("sent_pairs", len(sent_pairs))
-    return sent_pairs
-
-
-def make_dataset(sentence_pairs):
-    ids_lo, ids_hi = [], []
-    for i, (s1, s2) in enumerate(sentence_pairs):
-        ids_lo.append(sentence_to_ids(s1))
-        ids_hi.append(sentence_to_ids(s2))
-    ids_lo, ids_hi = select(ids_lo, ids_hi, SAMPLE)
-    ids_lo, ids_hi = torch.cat(ids_lo, dim=0), torch.cat(ids_hi, dim=0)
-    dataset = TensorDataset(ids_lo, ids_hi)
-    return dataset
-
-
-def select(lo, hi, sample):
-    assert len(lo) == len(hi)
-    random.seed(42)
-    idxs = random.choices(range(len(lo)), k=sample)
-    res_lo, res_hi = [], []
-    for i in idxs:
-        res_lo.append(lo[i])
-        res_hi.append(hi[i])
-    return res_lo, res_hi
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src", type=str, required=True)
+    parser.add_argument("--out", type=str, required=True)
+    parser.add_argument("--lang", type=str, required=True)
+    parser.add_argument("--parallel", action="store_true")
+    parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--use_cache", action="store_true")
+    parser.add_argument("--cache", type=str)
+    parser.add_argument("--dataset_size", type=int, default=4096)
+    parser.add_argument("--message", type=str, default="m2 to dataset experiment.")
+    return parser.parse_args()
 
 
 def main():
-    # parse_arguments
-    parser = argparse.ArgumentParser(description='Process M2 to dataset for proposal training.')
-    parser.add_argument('--m2_train', type=str, required=True, help='M2 file path.')
-    parser.add_argument('--m2_test', type=str, required=True, help='M2 file path.')
-    parser.add_argument('--save_path', type=str, required=True, help='Directory to save dataset.')
-    args = parser.parse_args()
-
-    db_train = parse_m2_to_db(args.m2_train)
-    sources_train = [x[0] for x in db_train]
-    changes_train = [x[1] for x in db_train]
-    db_test = parse_m2_to_db(args.m2_test)
-    sources_test = [x[0] for x in db_test]
-    changes_test = [x[1] for x in db_test]
-
-    # get candidate pairs
-    sentence_pairs_train = []
-    for source, changes in zip(sources_train, changes_train):
-        # changes ; [][][]
-        if len(changes) > 0:
-            sentence_pairs_train.extend(get_sent_pairs(source, changes, LIMIT))
-
-    sentence_pairs_test = []
-    for source, changes in zip(sources_test, changes_test):
-        # changes ; [][][]
-        if len(changes) > 0:
-            sentence_pairs_test.extend(get_sent_pairs(source, changes, LIMIT))
-
-    # make dataset
-    dataset_train = make_dataset(sentence_pairs_train)
-    dataset_test = make_dataset(sentence_pairs_test)
-
-    # save dataset
-    os.makedirs(args.save_path, exist_ok=True)
-    print("save path:", args.save_path)
-    with open(os.path.join(args.save_path, f"dataset_train_{LIMIT}.pkl"), "wb") as f:
-        pickle.dump(dataset_train, f)
-    with open(os.path.join(args.save_path, f"dataset_test_{LIMIT}.pkl"), "wb") as f:
-        pickle.dump(dataset_test, f)
+    args = parse_args()
+    dataset = M2Dataset(args)
 
 
 if __name__ == "__main__":
